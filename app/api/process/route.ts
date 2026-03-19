@@ -1,11 +1,4 @@
 import { NextRequest } from 'next/server';
-import { writeFile } from 'fs/promises';
-import { join } from 'path';
-import os from 'os';
-import ffmpeg from 'fluent-ffmpeg';
-import ffmpegStatic from 'ffmpeg-static';
-import ffprobeStatic from 'ffprobe-static';
-import fs from 'fs';
 import { nemotronClient, NEMOTRON_MODEL, vilaClient, VILA_MODEL } from '@/lib/nvidia';
 
 export const dynamic = 'force-dynamic';
@@ -19,33 +12,6 @@ export async function POST(req: NextRequest) {
       };
 
       try {
-        const ffmpegPath = join(process.cwd(), 'node_modules', 'ffmpeg-static', 'ffmpeg');
-        const ffprobePath = join(
-          process.cwd(),
-          'node_modules',
-          'ffprobe-static',
-          'bin',
-          os.platform(),
-          os.arch(),
-          os.platform() === 'win32' ? 'ffprobe.exe' : 'ffprobe'
-        );
-
-        if (fs.existsSync(ffmpegPath)) {
-          ffmpeg.setFfmpegPath(ffmpegPath);
-        } else {
-          sendLog(`Error: ffmpeg-static binary not found at ${ffmpegPath}`);
-          controller.close();
-          return;
-        }
-
-        if (fs.existsSync(ffprobePath)) {
-          ffmpeg.setFfprobePath(ffprobePath);
-        } else {
-          sendLog(`Error: ffprobe-static binary not found at ${ffprobePath}`);
-          controller.close();
-          return;
-        }
-
         sendLog("Agent [Orchestrator]: Analyzing request pipeline...");
 
         const formData = await req.formData();
@@ -59,64 +25,47 @@ export async function POST(req: NextRequest) {
         }
 
         sendLog(`Agent [Orchestrator]: Received video segment (${file.size} bytes). Target Excitement: ${excitement}/10`);
+        sendLog(`Agent [VideoAnalyzer]: Encoding raw video directly for multi-modal analysis...`);
 
-        // 1. Save file locally
+        // 1. Convert File to Base64
         const bytes = await file.arrayBuffer();
         const buffer = Buffer.from(bytes);
-        const tempDir = os.tmpdir();
-        const videoPath = join(tempDir, `input-${Date.now()}.mp4`);
-        const framePath = join(tempDir, `frame-${Date.now()}.jpg`);
-        
-        await writeFile(videoPath, buffer);
-        sendLog(`Agent [VideoAnalyzer]: Video saved locally, extracting keyframe context...`);
+        const base64Video = buffer.toString('base64');
+        const videoType = file.type || "video/mp4";
+        const dataUri = `data:${videoType};base64,${base64Video}`;
 
-        // 2. Extract a frame
-        await new Promise<void>((resolve, reject) => {
-          ffmpeg(videoPath)
-            .screenshots({
-              timestamps: ['50%'],
-              filename: framePath.split('/').pop(),
-              folder: tempDir,
-              size: '1280x720' // scale down to save token bandwidth
-            })
-            .on('end', () => resolve())
-            .on('error', (err) => reject(err));
-        });
+        sendLog("Agent [Nemotron Nano]: Calling Multi-modal Endpoint with full video context (/no_think)...");
 
-        sendLog("Agent [VideoAnalyzer]: Keyframe extracted successfully. Calling VILA Multi-modal Endpoint...");
-
-        // 3. VILA Vision Processing
-        const frameData = fs.readFileSync(framePath);
-        const base64Frame = frameData.toString('base64');
-        const dataUri = `data:image/jpeg;base64,${base64Frame}`;
-
+        // 2. Nemotron Nano Vision Processing (Full Video)
         const vilaResponse = await vilaClient.chat.completions.create({
-          model: VILA_MODEL,
+          model: VILA_MODEL, 
           messages: [
             {
               role: "system",
-              content: "/think",
+              content: "/no_think", // Videos only support /no_think
             },
             {
               role: "user",
               content: [
-                { type: "text", text: "Describe what is happening in this esports gameplay frame in vivid detail. Note the action, the environment, and the stakes." },
+                { type: "text", text: "Describe what is happening in this esports gameplay video in vivid detail. Note the action, the environment, and the stakes." },
                 {
-                  type: "image_url",
-                  image_url: {
+                  type: "video_url",
+                  video_url: {
                     url: dataUri,
                   },
                 },
               ],
             },
           ],
-          max_tokens: 500,
+          max_tokens: 4096,
+          temperature: 1,
+          top_p: 1,
         });
 
         const sceneDescription = vilaResponse.choices[0]?.message?.content || "No description generated.";
-        sendLog(`Agent [VILA]: Scene context generated: "${sceneDescription.substring(0, 80)}..."`);
+        sendLog(`Agent [Nemotron Nano]: Scene context generated: "${sceneDescription.substring(0, 80).replace(/\n/g, ' ')}..."`);
         
-        // 4. Nemotron Script Writer
+        // 3. Nemotron Script Writer
         sendLog(`Agent [ScriptWriter]: Invoking Nemotron 120B with context and Excitement=${excitement}...`);
         
         const scriptPrompt = `
@@ -139,14 +88,6 @@ Return ONLY the text of the script. No XML, no markdown formatting, no prefix.
         const scriptText = nemotronResponse.choices[0]?.message?.content?.trim() || "No script generated.";
         sendLog(`Agent [ScriptWriter]: ${scriptText}`);
         
-        // 5. Cleanup and finish
-        try {
-          fs.unlinkSync(videoPath);
-          fs.unlinkSync(framePath);
-        } catch (e: any) {
-          // ignore cleanup errors
-        }
-
         sendLog(`Agent [Orchestrator]: Pipeline complete. Narration ready for TTS playback.`);
         
         // Output audio hook if requested for the client to read
