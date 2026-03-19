@@ -41,9 +41,17 @@ export default function Home() {
     if ('speechSynthesis' in window) {
       window.speechSynthesis.cancel();
     }
+    // @ts-ignore
+    if (window._ttsAudio) {
+      // @ts-ignore
+      window._ttsAudio.pause();
+      // @ts-ignore
+      window._ttsAudio.currentTime = 0;
+    }
     if (videoRef.current) {
       videoRef.current.pause();
       videoRef.current.muted = false;
+      videoRef.current.volume = 1.0;
     }
     setIsPlayingHype(false);
   }, []);
@@ -100,10 +108,8 @@ export default function Home() {
     }
   };
 
-  const toggleHypeCast = () => {
+  const toggleHypeCast = async () => {
     if (!videoRef.current || !script) return;
-
-    const synth = window.speechSynthesis;
 
     // ── STOP ──────────────────────────────────────────────────────────
     if (isPlayingHype) {
@@ -113,72 +119,65 @@ export default function Home() {
 
     // ── PLAY ──────────────────────────────────────────────────────────
     console.log('[TTS] === PLAY HYPE CAST ===');
-    console.log('[TTS] Script length:', script.length);
-    console.log('[TTS] Script preview:', script.substring(0, 80));
 
-    // 1. Mute video completely & play
+    // 1. Duck video & play
     videoRef.current.currentTime = 0;
-    videoRef.current.muted = true;
+    videoRef.current.volume = 0.15;
+    videoRef.current.muted = false; // ensure it's not muted from previous attempts
     videoRef.current.play();
 
-    // 2. TTS — everything MUST be synchronous in the click gesture stack.
-    //    Do NOT use setTimeout or cancel() before speak().
-    if ('speechSynthesis' in window) {
-      const voices = voicesRef.current.length > 0
-        ? voicesRef.current
-        : synth.getVoices();
-      console.log('[TTS] Available voices:', voices.length);
+    setIsPlayingHype(true);
+    ttsActiveRef.current = true;
 
-      const utterance = new SpeechSynthesisUtterance(script);
+    // 2. TTS Server-side
+    try {
+      const res = await fetch('/api/tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text: script,
+          rate: excitement > 7 ? 1.3 : excitement < 4 ? 0.8 : 1.0,
+        }),
+      });
 
-      // @ts-ignore – prevent Chrome V8 GC from killing the live utterance
-      window._hackathonUtterance = utterance;
-
-      utterance.rate   = excitement > 7 ? 1.2 : excitement < 4 ? 0.9 : 1.0;
-      utterance.pitch  = excitement > 7 ? 1.3 : 1.0;
-      utterance.volume = 1.0;
-      utterance.lang   = 'en-US';
-
-      const preferredVoice =
-        voices.find(v => v.lang.startsWith('en') && v.name.includes('Google')) ||
-        voices.find(v => v.lang.startsWith('en') && !v.localService) ||
-        voices.find(v => v.lang.startsWith('en')) ||
-        voices[0];
-      if (preferredVoice) {
-        utterance.voice = preferredVoice;
-        console.log('[TTS] Selected voice:', preferredVoice.name, preferredVoice.lang);
-      } else {
-        console.warn('[TTS] No voice found! Using browser default.');
+      if (!res.ok) {
+        console.error('[TTS] API error:', res.status);
+        if (ttsActiveRef.current) stopHypeCast();
+        return;
       }
 
-      ttsActiveRef.current = true;
+      if (!ttsActiveRef.current) return; // check if cancelled while fetching
 
-      utterance.onstart = () => {
-        console.log('[TTS] ✅ onstart fired — speech is playing');
-      };
-
-      utterance.onend = () => {
-        console.log('[TTS] onend fired, ttsActive:', ttsActiveRef.current);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      
+      // @ts-ignore – anchor to window to prevent GC
+      window._ttsAudio = audio;
+      audio.volume = 1.0;
+      
+      audio.onended = () => {
         if (!ttsActiveRef.current) return;
         ttsActiveRef.current = false;
         setIsPlayingHype(false);
-        if (videoRef.current) videoRef.current.muted = false;
+        if (videoRef.current) videoRef.current.volume = 1.0;
+        URL.revokeObjectURL(url);
       };
-
-      utterance.onerror = (e) => {
-        console.error('[TTS] ❌ onerror fired:', e.error, e);
+      
+      audio.onerror = () => {
+        console.error('[TTS] Audio playback error');
         if (!ttsActiveRef.current) return;
         ttsActiveRef.current = false;
         setIsPlayingHype(false);
-        if (videoRef.current) videoRef.current.muted = false;
+        if (videoRef.current) videoRef.current.volume = 1.0;
+        URL.revokeObjectURL(url);
       };
-
-      // Speak synchronously — NO cancel() before, NO setTimeout wrapper
-      synth.speak(utterance);
-      console.log('[TTS] speak() called. speaking:', synth.speaking, 'pending:', synth.pending, 'paused:', synth.paused);
+      
+      audio.play();
+    } catch (err) {
+      console.error('[TTS] Fetch error:', err);
+      if (ttsActiveRef.current) stopHypeCast();
     }
-
-    setIsPlayingHype(true);
   };
 
   return (
@@ -306,28 +305,60 @@ export default function Home() {
                 <div className="bg-neutral-950 p-5 rounded-xl border border-neutral-800/80 flex flex-col gap-4">
                   <p className="text-emerald-400/90 leading-relaxed italic text-lg font-medium">&quot;{script}&quot;</p>
                   <button
-                    onClick={() => {
+                    onClick={async () => {
                       if (!script) return;
-                      const synth = window.speechSynthesis;
+
+                      // Stop if already playing
                       if (isSpeaking) {
-                        synth.cancel();
+                        // @ts-ignore
+                        if (window._ttsAudio) {
+                          // @ts-ignore
+                          window._ttsAudio.pause();
+                          // @ts-ignore
+                          window._ttsAudio.currentTime = 0;
+                        }
                         setIsSpeaking(false);
                         return;
                       }
-                      const utterance = new SpeechSynthesisUtterance(script);
-                      // @ts-ignore – prevent Chrome GC
-                      window._hackathonUtterance = utterance;
-                      utterance.rate = excitement > 7 ? 1.2 : excitement < 4 ? 0.9 : 1.0;
-                      utterance.pitch = excitement > 7 ? 1.3 : 1.0;
-                      utterance.volume = 1.0;
-                      utterance.lang = 'en-US';
-                      const voices = voicesRef.current.length > 0 ? voicesRef.current : synth.getVoices();
-                      const voice = voices.find(v => v.lang.startsWith('en')) || voices[0];
-                      if (voice) utterance.voice = voice;
-                      utterance.onend = () => setIsSpeaking(false);
-                      utterance.onerror = () => setIsSpeaking(false);
-                      synth.speak(utterance);
+
                       setIsSpeaking(true);
+
+                      try {
+                        const res = await fetch('/api/tts', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify({
+                            text: script,
+                            rate: excitement > 7 ? 1.3 : excitement < 4 ? 0.8 : 1.0,
+                          }),
+                        });
+
+                        if (!res.ok) {
+                          console.error('[TTS] API error:', res.status);
+                          setIsSpeaking(false);
+                          return;
+                        }
+
+                        const blob = await res.blob();
+                        const url = URL.createObjectURL(blob);
+                        const audio = new Audio(url);
+                        // @ts-ignore – anchor to window to prevent GC
+                        window._ttsAudio = audio;
+                        audio.volume = 1.0;
+                        audio.onended = () => {
+                          setIsSpeaking(false);
+                          URL.revokeObjectURL(url);
+                        };
+                        audio.onerror = () => {
+                          console.error('[TTS] Audio playback error');
+                          setIsSpeaking(false);
+                          URL.revokeObjectURL(url);
+                        };
+                        audio.play();
+                      } catch (err) {
+                        console.error('[TTS] Fetch error:', err);
+                        setIsSpeaking(false);
+                      }
                     }}
                     className="flex items-center justify-center gap-2 bg-emerald-500 hover:bg-emerald-400 text-neutral-950 font-bold py-3 px-6 rounded-xl transition-all active:scale-95 w-full"
                   >
